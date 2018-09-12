@@ -10,8 +10,7 @@ header-includes:
 ---
 
 ```{r setup, include=FALSE}
-needed_packages <- c("tidyverse", "tidybayes", "rstan", "here", "fs", "glue",
-  "hrbrthemes", "patchwork")
+needed_packages <- c("tidyverse", "tidybayes", "rstan", "here", "fs", "glue")
 load_packages <- function(x) {
   if (!x %in% installed.packages()) {
     if (x == "patchwork") {
@@ -36,7 +35,7 @@ knitr::opts_chunk$set(
 
 # The data
 
-For this example, I have simulated an example data set with 500 respondents taking a 20 item test. Further, there is 5 percent missing data. *Stan* cannot handle missing data explicity. Therefore, we must turn the explicit missing data into implicit missing data. This can be done by transforming the data from wide format to long format, and filtering out any cases where the score is `NA`.
+For this example, I have simulated an example data set with 1,000 respondents taking a 30 item test. Further, there is 5 percent missing data. *Stan* cannot handle missing data explicity. Therefore, we must turn the explicit missing data into implicit missing data. This can be done by transforming the data from wide format to long format, and filtering out any cases where the score is `NA`.
 
 ```{r read-data}
 response_data <- read_csv(here("data/sample-data.csv"),
