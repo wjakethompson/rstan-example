@@ -1,0 +1,245 @@
+---
+title: "Using rstan"
+author: "Jake Thompson"
+date: "9/12/2018"
+output:
+  bookdown::pdf_document2:
+    toc: false
+header-includes:
+  - \usepackage{float}
+---
+
+```{r setup, include=FALSE}
+needed_packages <- c("tidyverse", "tidybayes", "rstan", "here", "fs", "glue",
+  "hrbrthemes", "patchwork")
+load_packages <- function(x) {
+  if (!x %in% installed.packages()) {
+    if (x == "patchwork") {
+      remotes::install_github("thomasp85/patchwork")
+    } else {
+      install.packages(x)
+    }
+  }
+  suppressPackageStartupMessages(require(x, character.only = TRUE))
+}
+vapply(needed_packages, load_packages, logical(1))
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  collapse = TRUE,
+  cache = FALSE,
+  fig.path = "figures/",
+  out.extra = "",
+  fig.align = "center"
+)
+```
+
+# The data
+
+For this example, I have simulated an example data set with 500 respondents taking a 20 item test. Further, there is 5 percent missing data. *Stan* cannot handle missing data explicity. Therefore, we must turn the explicit missing data into implicit missing data. This can be done by transforming the data from wide format to long format, and filtering out any cases where the score is `NA`.
+
+```{r read-data}
+response_data <- read_csv(here("data/sample-data.csv"),
+  col_types = cols(.default = col_integer())) %>%
+  gather(key = "item_id", value = "score", -student_id) %>%
+  mutate(item_id = as.integer(item_id)) %>%
+  filter(!is.na(score)) %>%
+  arrange(student_id, item_id)
+
+response_data
+```
+
+The data must then be formatted for use in *Stan*. The **rstan** package expects a named list, with the names corresponding to the data elements defined in the `.stan` file. Looking at `Stan/irt-3pl.stan`, we see the following (the full `.stan` file can be seen in Appendix \@ref(full-stan)):
+
+```{stan stan-data, output.var = "stan-data", eval = FALSE}
+data {
+  int<lower=1> J;                         // number of respondents
+  int<lower=1> K;                         // number of items
+  int<lower=1> N;                         // number of observations
+  int<lower=1,upper=J> jj[N];             // respondent for observation n
+  int<lower=1,upper=K> kk[N];             // item for observation n
+  int<lower=0,upper=1> y[N];              // score for observation n
+}
+```
+
+\newpage
+
+We can therefore define our data for the **rstan** package as a list with the elements `J`, `K`, `N`, `jj`, `kk`, and `y`.
+
+```{r define-stan}
+stan_data = list(
+  J = length(unique(response_data$student_id)),
+  K = length(unique(response_data$item_id)),
+  N = nrow(response_data),
+  jj = response_data$student_id,
+  kk = response_data$item_id,
+  y = response_data$score
+)
+```
+
+Now that the data has been correctly defined, we can estimate the model.
+
+# Model estimation
+
+The model can be estimated by using the `stan` function. Here, we provide the path to the `.stan` script and our previously created data list. We also specify the number of chains, length of each chain, and the length of the warm-up or burn-in period. Because we have three chains, each with 2,000 iterations with the first 1,000 discarded, we will end up with total of 3,000 samples in our posteriors (1,000 from each chain).
+
+```{r print-model-est, eval = FALSE}
+model <- stan(file = here("Stan/irt-3pl.stan"), data = stan_data, chains = 3,
+  iter = 2000, warmup = 1000, cores = 3)
+```
+
+```{r model-est, include = FALSE}
+if (!file_exists(here("data/estimated-model.rds"))) {
+  model <- stan(file = here("Stan/irt-3pl.stan"), data = stan_data, chains = 3,
+    iter = 2000, warmup = 1000, cores = 3, seed = 9416)
+  write_rds(model, here("data/estimated-model.rds"), compress = "gz")
+} else {
+  model <- read_rds(here("data/estimated-model.rds"))
+}
+```
+
+\newpage
+
+# Model analysis
+
+We can view a summary of the model by using the summary function. By default, the summary method for `stanfit` objects returns a list with elements `summary` and `c_summary`, which provide the summary for merged chains and individual chains respectively. This summary provides us with the mean, Monte Carlo standard error, standard deviation, quantiles, effective sample size, and Rhat values.
+
+```{r stan-summary}
+model_summary <- summary(model, pars = c("theta", "b", "a", "c"),
+    probs = c(0.025, 0.50, 0.975))$summary %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "parameter") %>%
+  as_data_frame() %>%
+  separate(parameter, into = c("param", "index"), sep = "\\[|\\]",
+    extra = "drop", convert = TRUE) %>%
+  mutate_if(is.double, round, digits = 2)
+
+model_summary
+```
+
+## Parameter recovery
+
+We can then use our estimates to look at the parameter recovery of our model, to make sure it is specified correctly. Let's first look at the recovery of our person parameters ($\theta$). The true values used to simulate the data are saved in the `data/` directory. The estimated values can be extracted from the `model_summary`. Finally, we can join the two sets of estimates together, and create a plot like in Figure \@ref(fig:theta-recovery).
+
+```{r theta-data}
+true_theta <- read_csv(here("data/respondent-parameters.csv"),
+  col_types = cols(respondent_id = col_integer(), theta = col_double())) %>%
+  rename(true_theta = theta)
+
+est_theta <- model_summary %>%
+  filter(param == "theta") %>%
+  select(respondent_id = index, est_theta = mean)
+
+theta_recovery <- left_join(true_theta, est_theta, by = "respondent_id")
+```
+
+(ref:theta-cap) Recovery of $\theta$ parameter.
+
+```{r theta-recovery, echo = FALSE, fig.width = 4, fig.height = 4, fig.pos = "H", fig.cap = "(ref:theta-cap)"}
+theta_cor <- theta_recovery %>%
+  summarize(cor = cor(true_theta, est_theta)) %>%
+  mutate(label = glue("r = {sprintf('%0.2f', cor)}")) %>%
+  mutate(x = 3, y = -3)
+
+ggplot(theta_recovery, aes(x = true_theta, y = est_theta)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "blue") +
+  geom_text(data = theta_cor, aes(x = x, y = y, label = label), size = 3,
+    hjust = 1, vjust = 0) +
+  coord_equal() +
+  expand_limits(x = c(-3, 3), y = c(-3, 3)) +
+  scale_x_continuous(breaks = seq(-10, 10, 1)) +
+  scale_y_continuous(breaks = seq(-10, 10, 1)) +
+  labs(x = "True Value", y = "Estimated Value") +
+  theme_bw()
+```
+
+Here we can see that the correlation between our true values and estimated values is `r sprintf("%0.2f", pull(theta_cor, cor))`, indicating good recovery of the person parameters.
+
+\newpage
+
+Similarly, we can examine the recovery of the item parameters. The true values for the item parameters can also be found in the `data/` directory, and the estimated values extracted from the `model_summary`. We can then create a facetted plot, as in Figure \@ref(fig:item-recovery), to view the recovery for all item parameters at the same time.
+
+```{r item-data}
+true_item <- read_csv(here("data/item-parameters.csv"),
+  col_types = cols(.default = col_double(), item_id = col_integer())) %>%
+  gather(key = "param", value = "true_value", -item_id)
+
+est_item <- model_summary %>%
+  filter(param %in% c("b", "a", "c")) %>%
+  select(param, item_id = index, est_value = mean)
+
+item_recovery <- left_join(true_item, est_item, by = c("param", "item_id"))
+```
+
+```{r item-recovery, echo = FALSE, fig.width = 6, fig.height = 4, fig.pos = "H", fig.cap = "Recovery of item parameters"}
+item_cor <- item_recovery %>%
+  mutate(param = factor(param, levels = c("b", "a", "c"))) %>%
+  group_by(param) %>%
+  summarize(cor = cor(true_value, est_value)) %>%
+  mutate(label = glue("r = {sprintf('%0.2f', cor)}")) %>%
+  mutate(x = c(2, 3, 0.35), y = c(-2, 0, 0.15))
+
+dummy <- data_frame(
+  param = factor(c("b", "a", "c"), levels = c("b", "a", "c")),
+  min_x = c(-2, 0, 0.15),
+  max_x = c(2, 3, 0.35),
+  min_y = c(-2, 0, 0.15),
+  max_y = c(2, 3, 0.35)
+)
+
+item_recovery <- mutate(item_recovery,
+  param = factor(param, levels = c("b", "a", "c")))
+ggplot(item_recovery, aes(x = true_value, y = est_value)) +
+  facet_wrap(~ param, nrow = 1, scales = "free") +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "blue") +
+  geom_text(data = item_cor, aes(x = x, y = y, label = label), size = 3,
+    hjust = 1, vjust = 0) +
+  geom_blank(data = dummy, aes(x = min_x, y = min_y)) +
+  geom_blank(data = dummy, aes(x = max_x, y = max_y)) +
+  labs(x = "True Value", y = "Estimated Value") +
+  theme_bw()
+```
+
+In Figure \@ref(fig:item-recovery) we can see that we have excellent recovery for the *b* (`r item_cor %>% filter(param == "b") %>% pull(label)`) and *a* (`r item_cor %>% filter(param == "a") %>% pull(label)`) parameters, and moderate to poor recovery for the *c* parameters `r item_cor %>% filter(param == "c") %>% pull(label)`.
+
+\newpage
+
+# (APPENDIX) Appendix {-} 
+
+# *Stan* code for 3-PL item response theory model {#full-stan}
+
+```{stan full-stan-model, output.var= "full-stan-model", eval = FALSE}
+data {
+  int<lower=1> J;                         // number of respondents
+  int<lower=1> K;                         // number of items
+  int<lower=1> N;                         // number of observations
+  int<lower=1,upper=J> jj[N];             // respondent for observation n
+  int<lower=1,upper=K> kk[N];             // item for observation n
+  int<lower=0,upper=1> y[N];              // score for observation n
+}
+parameters {
+  real theta[J];
+  real b[K];
+  real<lower=0> a[K];
+  real<lower=0,upper=1> c[K];
+}
+model {
+  vector[N] eta;
+  
+  // priors
+  theta ~ normal(0, 1);
+  b ~ normal(0, 10);
+  a ~ lognormal(0.5, 1);
+  c ~ beta(5, 17);
+  
+  // model
+  for (n in 1:N) {
+    eta[n] = c[kk[n]] + (1 - c[kk[n]]) * inv_logit(a[kk[n]] * (theta[jj[n]] - b[kk[n]]));
+  }
+  y ~ bernoulli(eta);
+}
+```
+
+
